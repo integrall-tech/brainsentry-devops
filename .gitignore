@@ -1,0 +1,18 @@
+# Local configuration with credentials
+.env
+
+# Generated secrets (never commit!)
+secrets/*.txt
+!secrets/.gitkeep
+
+# Local backups
+backups/
+
+# Local logs
+logs/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp

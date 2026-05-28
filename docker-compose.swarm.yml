@@ -1,0 +1,182 @@
+# brainsentry — Docker Swarm stack
+#
+# Hybrid topology: bundles a DEDICATED Postgres (pgvector required by
+# migration 8) but reuses Redis + FalkorDB from the dev-env-devops
+# stack via the external `devops` overlay network.
+#
+# Deploy:  scripts/deploy.sh
+# Bring down: scripts/undeploy.sh
+# First-time migrations: scripts/migrate.sh
+
+# We pin to the v3.8+ compose format because docker stack respects it.
+
+services:
+
+  # ==========================================================================
+  # DEDICATED Postgres (pgvector — migration 8 needs vector(1536))
+  # ==========================================================================
+  brainsentry-postgres:
+    image: pgvector/pgvector:pg18
+    hostname: brainsentry-postgres
+    environment:
+      - POSTGRES_USER=brainsentry
+      - POSTGRES_PASSWORD_FILE=/run/secrets/brainsentry_postgres_password
+      - POSTGRES_DB=brainsentry
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      - TZ=${TZ:-America/Sao_Paulo}
+    secrets:
+      - brainsentry_postgres_password
+    volumes:
+      - brainsentry_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${BRAINSENTRY_POSTGRES_PORT:-5445}:5432"
+    networks:
+      - devops
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      resources:
+        limits: { cpus: '1.0', memory: 1G }
+        reservations: { memory: 512M }
+    labels:
+      - "com.brainsentry.role=database"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brainsentry -d brainsentry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "3" }
+
+  # ==========================================================================
+  # Backend (Go API)
+  # ==========================================================================
+  brainsentry-backend:
+    image: ghcr.io/integrall-tech/brainsentry-backend:${BACKEND_IMAGE_TAG:-latest}
+    hostname: brainsentry-backend
+    ports:
+      - "${BRAINSENTRY_BACKEND_PORT:-8081}:8081"
+    environment:
+      - DB_HOST=brainsentry-postgres
+      - DB_PORT=5432
+      - DB_NAME=brainsentry
+      - DB_USER=brainsentry
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
+      - AI_MODEL=${BRAINSENTRY_AI_MODEL:-anthropic/claude-haiku-4-5}
+      - CORS_ORIGINS=${BRAINSENTRY_CORS_ORIGINS:-http://localhost:3000,https://*.integrall.tech}
+      - TZ=${TZ:-America/Sao_Paulo}
+    # The Go binary reads passwords from env vars (config.go's
+    # applyEnvOverrides). The entrypoint exports each secret into the
+    # process before exec'ing the binary so SIGTERM on swarm stop still
+    # reaches it.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        export DB_PASSWORD="$$(cat /run/secrets/brainsentry_postgres_password)"
+        export REDIS_PASSWORD="$$(cat /run/secrets/redis_password)"
+        export FALKORDB_PASSWORD="$$(cat /run/secrets/falkordb_password)"
+        export JWT_SECRET="$$(cat /run/secrets/brainsentry_jwt_secret)"
+        export BRAINSENTRY_AI_AGENTIC_MODEL_API_KEY="$$(cat /run/secrets/brainsentry_llm_api_key)"
+        exec /app/brainsentry
+    secrets:
+      - brainsentry_postgres_password
+      - brainsentry_jwt_secret
+      - brainsentry_llm_api_key
+      - redis_password
+      - falkordb_password
+    networks:
+      - devops
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      resources:
+        limits: { cpus: '2.0', memory: 1G }
+        reservations: { memory: 512M }
+    labels:
+      - "com.brainsentry.role=backend"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "3" }
+
+  # ==========================================================================
+  # Frontend (React SPA + nginx + /api proxy)
+  # ==========================================================================
+  brainsentry-frontend:
+    image: ghcr.io/integrall-tech/brainsentry-frontend:${FRONTEND_IMAGE_TAG:-latest}
+    hostname: brainsentry-frontend
+    ports:
+      - "${BRAINSENTRY_FRONTEND_PORT:-8086}:80"
+    environment:
+      - TZ=${TZ:-America/Sao_Paulo}
+    networks:
+      - devops
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      resources:
+        limits: { cpus: '0.3', memory: 128M }
+        reservations: { memory: 64M }
+    labels:
+      - "com.brainsentry.role=frontend"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "3" }
+
+# --------------------------------------------------------------------------
+# External resources from dev-env-devops
+# --------------------------------------------------------------------------
+
+networks:
+  # The shared overlay where dev-env-devops's redis + falkordb + others
+  # already live. Created by `docker stack deploy -c stack.yml devops`
+  # in the dev-env-devops repo; we just attach.
+  devops:
+    external: true
+    name: devops_devops
+
+secrets:
+  # Owned by brainsentry-devops (generated via scripts/setup-secrets.sh).
+  brainsentry_postgres_password:
+    file: ./secrets/brainsentry_postgres_password.txt
+  brainsentry_jwt_secret:
+    file: ./secrets/brainsentry_jwt_secret.txt
+  brainsentry_llm_api_key:
+    file: ./secrets/brainsentry_llm_api_key.txt
+
+  # Reused from the dev-env-devops stack — swarm prefixes secret names
+  # with the stack name they were declared under, so we reference by
+  # full swarm name and tell compose they already exist.
+  redis_password:
+    external: true
+    name: devops_redis_password
+  falkordb_password:
+    external: true
+    name: devops_falkordb_password
+
+volumes:
+  brainsentry_postgres_data:

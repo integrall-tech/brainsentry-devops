@@ -1,0 +1,34 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  compose-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate docker-compose.swarm.yml syntax
+        # `docker compose config` parses + resolves interpolation. We
+        # pass a minimal .env so the variable substitution succeeds.
+        # External resources (networks, secrets) don't need to exist
+        # for the config check.
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.swarm.yml --env-file .env config >/dev/null
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck on every script
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: ./scripts
+          severity: warning
