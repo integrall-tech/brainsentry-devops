@@ -35,7 +35,7 @@ echo "[info] postgres container: ${PG_CONTAINER}"
 
 # Wait until the DB is ready (deploy.sh already does this but we may
 # be invoked separately).
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     if docker exec "$PG_CONTAINER" pg_isready -U brainsentry -d brainsentry >/dev/null 2>&1; then
         break
     fi

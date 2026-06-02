@@ -69,7 +69,7 @@ docker stack deploy \
 echo "[5/5] waiting for services to converge..."
 for svc in brainsentry-postgres brainsentry-backend brainsentry-frontend; do
     full="${STACK_NAME}_${svc}"
-    for i in $(seq 1 60); do
+    for _ in $(seq 1 60); do
         replicas=$(docker service ls --filter "name=${full}" --format "{{.Replicas}}" 2>/dev/null || echo "")
         if [ "$replicas" = "1/1" ]; then
             echo "  [ok]   ${full}"
