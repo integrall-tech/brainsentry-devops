@@ -18,8 +18,16 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
+# Auto-export every var from .env so `docker stack deploy` (which reads
+# from process env, not the .env file directly like `docker compose`
+# does) sees BACKEND_IMAGE_TAG / GHCR_* / etc. Without `set -a` the
+# vars are shell-local and the compose file's ${VAR:-default} falls
+# back to the defaults silently — we hit this in production where
+# `:latest` got pulled instead of the pinned `:0.1.0`.
 # shellcheck disable=SC1091
+set -a
 source .env
+set +a
 STACK_NAME="${STACK_NAME:-brainsentry}"
 
 # Sanity: external resources must exist before stack deploy can attach.
@@ -61,7 +69,7 @@ docker stack deploy \
 echo "[5/5] waiting for services to converge..."
 for svc in brainsentry-postgres brainsentry-backend brainsentry-frontend; do
     full="${STACK_NAME}_${svc}"
-    for i in $(seq 1 60); do
+    for _ in $(seq 1 60); do
         replicas=$(docker service ls --filter "name=${full}" --format "{{.Replicas}}" 2>/dev/null || echo "")
         if [ "$replicas" = "1/1" ]; then
             echo "  [ok]   ${full}"

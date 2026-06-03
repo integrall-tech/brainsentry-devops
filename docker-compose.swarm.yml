@@ -100,8 +100,12 @@ services:
         condition: on-failure
         max_attempts: 5
       resources:
+        # 256M reservation (not 512M) fits on small dev VPSes where the
+        # shared dev-env-devops stack already reserves ~7.5GB; the Go
+        # binary at idle uses ~80MB and peaks <200MB even under LLM
+        # compression load. Bump to 512M on hosts with headroom.
         limits: { cpus: '2.0', memory: 1G }
-        reservations: { memory: 512M }
+        reservations: { memory: 256M }
     labels:
       - "com.brainsentry.role=backend"
     healthcheck:

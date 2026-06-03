@@ -22,7 +22,7 @@ echo "[1/2] removing stack '${STACK_NAME}'..."
 docker stack rm "$STACK_NAME"
 
 echo "[2/2] waiting for cleanup..."
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     remaining=$(docker service ls --filter "label=com.docker.stack.namespace=${STACK_NAME}" -q | wc -l | tr -d ' ')
     [ "$remaining" = "0" ] && break
     sleep 1
