@@ -84,6 +84,11 @@ open http://localhost:8086/    # the SPA
 
 ## Day 2 operations
 
+> **Upgrading to a new version?** Follow [docs/RELEASE.md](docs/RELEASE.md).
+> There's an ordering gotcha (update backend → migrate → update frontend,
+> because `migrate.sh` reads the migrations from inside the backend image)
+> — the guide explains why and gives a step-by-step + checklist.
+
 ```bash
 # Update to a newer image tag (edit .env then redeploy)
 ./scripts/deploy.sh
