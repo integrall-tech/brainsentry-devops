@@ -190,7 +190,10 @@ brainsentry-devops/
 - **`relation "decisions" does not exist`** — faltou `./scripts/migrate.sh`.
 - **`extensão pgvector ausente`** — rode `./scripts/ensure-db.sh` (o
   `CREATE EXTENSION` exige superusuário, por isso não está nas migrações).
-- **`compression parse failed` no log** — o LLM configurado devolve JSON
-  malformado. Use `anthropic/claude-haiku-4-5` ou `google/gemini-2.5-flash`.
+- **`compression parse failed: unexpected end of JSON input`** — o modelo é de
+  raciocínio e gastou o `ai.max_tokens` pensando antes de escrever o JSON, que
+  chega truncado. Sintomas colaterais: `POST /v1/memories` levando 20-45s (são
+  3 retries) e 502 no Caddy. Meça antes de escolher o substituto:
+  `./scripts/bench-llm.sh <modelo>` — a coluna `RACIOCINIO` é o diagnóstico.
 - **Grafo vazio depois de um restore** — o FalkorDB é derivado:
   `docker exec brainsentry-backend /app/brainsentry --rebuild graph,embeddings,communities`.

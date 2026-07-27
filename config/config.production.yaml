@@ -58,10 +58,20 @@ tenant:
 
 ai:
   provider: openrouter
-  model: "anthropic/claude-haiku-4-5"   # ← AI_MODEL
+  # Escolhido por medição, não por gosto — ver scripts/bench-llm.sh.
+  # O backend faz json.Unmarshal direto na resposta, e max_tokens=500 é o
+  # orçamento TOTAL. Modelos de raciocínio gastam esse orçamento pensando e
+  # devolvem JSON truncado: com uma conversa de ~6000 chars (o teto do
+  # CompressionService), openai/gpt-oss-120b queimou 397 tokens em raciocínio
+  # e falhou 3/3, custando 3 retries e ~45s por memória. gemini-2.5-flash-lite
+  # faz 3/3 em ~2s por US$0,35/1000 chamadas.
+  # Antes de trocar este valor: ./scripts/bench-llm.sh <modelo-novo>
+  model: "google/gemini-2.5-flash-lite"  # ← AI_MODEL
   api_key: ""                            # ← BRAINSENTRY_AI_AGENTIC_MODEL_API_KEY
   base_url: "https://openrouter.ai/api/v1"
   temperature: 0.2
+  # Orçamento total (raciocínio + resposta). Subir isto é a alternativa a
+  # trocar de modelo, mas custa em toda chamada — medir antes.
   max_tokens: 500
   timeout: 60s
   max_retries: 3
