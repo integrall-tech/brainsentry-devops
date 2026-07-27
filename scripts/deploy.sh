@@ -73,6 +73,12 @@ if [[ "$DO_MIGRATE" == "1" ]]; then
   # O backend abre o pool antes das migrações existirem no primeiro deploy;
   # reiniciar garante que ele enxergue o schema já pronto.
   dc -f docker-compose.yml restart brainsentry-backend >/dev/null
+  # O FalkorDB é cache derivado e o backend NUNCA escreve nele em operação
+  # normal — sem este passo, /v1/graph/* responde com um grafo vazio depois
+  # de um deploy novo. Ver scripts/rebuild-graph.sh (precisa de cron também).
+  echo "      reconstruindo o grafo…"
+  sleep 5   # o backend precisa estar de pé para o docker exec
+  "$SCRIPT_DIR/rebuild-graph.sh" || echo "AVISO: rebuild do grafo falhou (não bloqueia o deploy)" >&2
 else
   echo "[4/6] (migrações puladas por --no-migrate)"
 fi
