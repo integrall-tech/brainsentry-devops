@@ -1,0 +1,33 @@
+# >>> brainsentry >>> (bloco gerenciado por scripts/caddy-sync.sh — NÃO editar à mão)
+# Instalado no Caddyfile compartilhado da VPS (/opt/bluevix/caddy/Caddyfile).
+# ${ROOT_DOMAIN} é renderizado a partir do .env pelo caddy-sync.sh.
+
+# SPA (React + nginx). O nginx interno faz proxy de /api/* para o backend,
+# então o app é same-origin e não depende de CORS.
+app.${ROOT_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy brainsentry-frontend:80
+}
+
+# API direta — para agentes MCP, CLI e TUI que falam com o backend sem passar
+# pelo SPA. Depende de CORS_ORIGINS no backend quando chamada pelo navegador.
+api.${ROOT_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy brainsentry-backend:8081 {
+		# Rotas de análise/compressão chamam o LLM e podem passar de 60s.
+		transport http {
+			response_header_timeout 180s
+		}
+	}
+}
+
+# Apex e www só redirecionam para o app (não servem conteúdo).
+${ROOT_DOMAIN}, www.${ROOT_DOMAIN} {
+	redir https://app.${ROOT_DOMAIN}{uri} permanent
+}
+
+# Receiver de CD (adnanh/webhook). Protegido por X-Deploy-Token.
+deploy.${ROOT_DOMAIN} {
+	reverse_proxy brainsentry-webhook:9000
+}
+# <<< brainsentry <<<

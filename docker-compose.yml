@@ -1,0 +1,155 @@
+# Camada de aplicação do brainsentry na VPS (docker compose, NÃO swarm).
+#
+# Reaproveita o que já existe na VPS (stack bluevix):
+#   - bluevix-postgres (pgvector)  → role/db dedicados "brainsentry"
+#   - bluevix-redis                → db 3 (isolado do bluevix, que usa db 0)
+#   - bluevix-caddy                → TLS + roteamento (caddy/brainsentry.caddy)
+# Sobe só o que ninguém mais provê: FalkorDB + backend + frontend.
+#
+#   docker compose --env-file .env up -d
+#
+# A stack swarm original (para o cluster Integrall) ficou em swarm/ — ver README.
+name: brainsentry
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+
+  # ==========================================================================
+  # FalkorDB — grafo de conhecimento (/v1/graph/*, GraphRAG, comunidades).
+  # Privado: só o backend alcança, pela rede interna desta stack.
+  # ==========================================================================
+  brainsentry-falkordb:
+    image: falkordb/falkordb:${FALKORDB_IMAGE_TAG:-v4.14.0}
+    container_name: brainsentry-falkordb
+    <<: [*restart, *logging]
+    environment:
+      # O entrypoint da imagem (/var/lib/falkordb/bin/run.sh) monta a linha do
+      # redis-server como: redis-server $REDIS_ARGS --protected-mode no
+      #   --dir $FALKORDB_DATA_PATH --loadmodule .../falkordb.so $FALKORDB_ARGS
+      # Ou seja: NÃO sobrescreva command — passe flags por REDIS_ARGS.
+      REDIS_ARGS: --requirepass ${FALKORDB_PASSWORD} --save 900 1 --save 300 10 --appendonly no
+      # A UI web (node) do FalkorDB não é usada aqui e economiza ~80MB.
+      BROWSER: "0"
+      # redis-cli lê a senha daqui — não aparece na tabela de processos.
+      REDISCLI_AUTH: ${FALKORDB_PASSWORD}
+      TZ: ${TZ:-America/Sao_Paulo}
+    volumes:
+      # FALKORDB_DATA_PATH da imagem — o RDB é escrito aqui.
+      - falkordb_data:/var/lib/falkordb/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - bsnet
+    deploy:
+      resources:
+        limits: { memory: 768M }
+
+  # ==========================================================================
+  # Backend (Go API) — /api/* na porta 8081.
+  # Segredos e hosts vêm do .env; o config.yaml montado carrega o resto
+  # (env sempre vence sobre o arquivo — internal/config/applyEnvOverrides).
+  # ==========================================================================
+  brainsentry-backend:
+    image: ghcr.io/integrall-tech/brainsentry-backend:${BACKEND_IMAGE_TAG:-latest}
+    container_name: brainsentry-backend
+    <<: [*restart, *logging]
+    environment:
+      # --- modo produção: fail-closed (recusa jwt default e demo auth) ---
+      BRAINSENTRY_ENV: production
+      DEMO_AUTH_ENABLED: "false"
+      TZ: ${TZ:-America/Sao_Paulo}
+      # --- Postgres compartilhado (bluevix-postgres, sem TLS na rede docker) ---
+      DB_HOST: ${BRAINSENTRY_DB_HOST:-bluevix-postgres}
+      DB_PORT: ${BRAINSENTRY_DB_PORT:-5432}
+      DB_NAME: ${BRAINSENTRY_DB_NAME:-brainsentry}
+      DB_USER: ${BRAINSENTRY_DB_USER:-brainsentry}
+      DB_PASSWORD: ${BRAINSENTRY_DB_PASSWORD}
+      # Em production o default vira "require"; o pg compartilhado não tem TLS
+      # e o tráfego não sai da rede docker, então desligamos explicitamente.
+      DB_SSLMODE: ${BRAINSENTRY_DB_SSLMODE:-disable}
+      # --- Redis compartilhado (bluevix-redis; o db 3 vem do config.yaml) ---
+      REDIS_HOST: ${BRAINSENTRY_REDIS_HOST:-bluevix-redis}
+      REDIS_PORT: ${BRAINSENTRY_REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${BRAINSENTRY_REDIS_PASSWORD:-}
+      # --- FalkorDB desta stack ---
+      FALKORDB_HOST: brainsentry-falkordb
+      FALKORDB_PORT: "6379"
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD}
+      # --- Segurança / LLM ---
+      JWT_SECRET: ${JWT_SECRET}
+      BRAINSENTRY_AI_AGENTIC_MODEL_API_KEY: ${BRAINSENTRY_AI_AGENTIC_MODEL_API_KEY}
+      AI_MODEL: ${BRAINSENTRY_AI_MODEL:-anthropic/claude-haiku-4-5}
+      # Chave nativa opcional: quando presente, entra na frente da chain.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # --- CORS: só quem consome a API por outra origem ---
+      CORS_ORIGINS: ${BRAINSENTRY_CORS_ORIGINS:-https://app.brainsentry.com.br}
+    volumes:
+      # Baseline não-secreto (redis db, embedding, tenant, interception…).
+      - ./config/config.production.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      - brainsentry-falkordb
+    networks:
+      - web       # bluevix_web      → o Caddy alcança "brainsentry-backend:8081"
+      - internal  # bluevix_internal → alcança bluevix-postgres e bluevix-redis
+      - bsnet     # privada          → alcança brainsentry-falkordb
+    deploy:
+      resources:
+        limits: { memory: 1G }
+
+  # ==========================================================================
+  # Frontend (SPA React + nginx). O nginx faz proxy de /api/* para
+  # "brainsentry-backend:8081" (docker/nginx.conf do repo da app), então o
+  # SPA é same-origin e não depende de CORS.
+  # ==========================================================================
+  brainsentry-frontend:
+    image: ghcr.io/integrall-tech/brainsentry-frontend:${FRONTEND_IMAGE_TAG:-latest}
+    container_name: brainsentry-frontend
+    <<: [*restart, *logging]
+    environment:
+      TZ: ${TZ:-America/Sao_Paulo}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      - brainsentry-backend
+    networks:
+      - web       # o Caddy alcança "brainsentry-frontend:80" e o nginx alcança o backend
+    deploy:
+      resources:
+        limits: { memory: 128M }
+
+volumes:
+  falkordb_data:
+
+networks:
+  web:
+    external: true
+    name: bluevix_web
+  internal:
+    external: true
+    name: bluevix_internal
+  bsnet:
+    driver: bridge

@@ -1,8 +1,13 @@
 # Release & upgrade guide
 
-How to ship a new brainsentry version to the swarm. Read this before
-your first upgrade — there is **one ordering gotcha** that will bite you
-if you run the steps in the obvious-but-wrong order.
+How to ship a new brainsentry version. Read this before your first
+upgrade — there is **one ordering gotcha** that will bite you if you run
+the steps in the obvious-but-wrong order.
+
+> **Dois alvos.** A ordenação abaixo vale para os dois, mas os comandos
+> diferem: a **VPS** (produção, `brainsentry.com.br`) usa docker compose —
+> pule para *"Na VPS (docker compose)"*. As seções com
+> `docker service update` são do **Swarm Integrall** (`swarm/`).
 
 ## TL;DR
 
@@ -39,7 +44,39 @@ new `.up.sql`.
 > doesn't ship the SQL, so you'd clone brainsentry.io for this. The
 > in-image path above is simpler and is what we use.
 
-## Full procedure
+## Na VPS (docker compose) — o caminho de produção
+
+`deploy-component.sh` já implementa a ordem correta (backend → migrate →
+frontend) e grava a tag no `.env`, que é a fonte de verdade do compose:
+
+```bash
+cd /opt/brainsentry-devops
+
+# release completo, na ordem segura:
+./scripts/deploy-component.sh all 0.X.0
+
+# ou um componente só:
+./scripts/deploy-component.sh backend 0.X.0
+./scripts/deploy-component.sh frontend 0.X.0
+
+./scripts/health-check.sh
+```
+
+Verificação pontual do schema (exemplo: coluna `provenance` da v0.2.0):
+
+```bash
+docker exec bluevix-postgres psql -U brainsentry -d brainsentry \
+  -tc "SELECT column_name FROM information_schema.columns
+       WHERE table_name='memories' AND column_name='provenance';"
+```
+
+Rollback: `./scripts/deploy-component.sh all 0.<prev>.0`. Vale a mesma
+ressalva de migrações forward-only descrita em *Rollback* mais abaixo.
+
+Peça aos usuários um hard-reload do SPA (`Cmd/Ctrl+Shift+R`) para não
+ficarem com o bundle antigo em cache.
+
+## Full procedure (Swarm Integrall)
 
 ### 1. Tag the source repo
 
