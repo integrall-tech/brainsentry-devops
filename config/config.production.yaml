@@ -67,17 +67,15 @@ ai:
   max_retries: 3
 
 embedding:
-  # ATENÇÃO — 1536 e não os 384 do dev. A migração 8 cria decisions.embedding e
-  # events.embedding como vector(1536); com 384 todo INSERT nessas tabelas
-  # falharia. O EmbeddingService gera vetores com ESTA dimensão (inclusive no
-  # fallback hash), então 1536 mantém tudo consistente e já casa com
-  # openai/text-embedding-3-small caso uma chave OpenAI seja plugada depois.
+  # O EmbeddingService usa ai.api_key + ai.base_url (não tem credencial
+  # própria), e o OpenRouter serve /embeddings além de /chat/completions —
+  # então a mesma chave cobre chat e embedding. O id segue o formato do
+  # OpenRouter (vendor/modelo), não o nome curto da OpenAI.
   #
-  # Hoje ai.base_url aponta para o OpenRouter, que NÃO tem /embeddings: cada
-  # Embed() faz uma chamada que falha e cai no fallback hash (busca semântica
-  # degradada, ~1 round-trip desperdiçado). Para embeddings reais, aponte
-  # ai.base_url para https://api.openai.com/v1 com uma chave OpenAI — mas note
-  # que o mesmo par chave/base_url também serve o LLM de chat.
+  # ATENÇÃO na dimensão — 1536 e não os 384 do dev: é o tamanho do
+  # text-embedding-3-small E a largura das colunas vector(1536) que a
+  # migração 8 cria em decisions/events. Com 384 todo INSERT nessas tabelas
+  # falharia. Vale também para o fallback por hash, que respeita este valor.
   model: "openai/text-embedding-3-small"
   dimensions: 1536
 

@@ -138,16 +138,27 @@ Dois valores que só existem no arquivo e importam:
 - **`embedding.dimensions: 1536`** — a migração 8 cria `vector(1536)`; com os
   384 do dev, todo INSERT em `decisions`/`events` falharia.
 
-### Qualidade da busca semântica (conhecido)
+### Embeddings
 
-`ai.base_url` aponta para o OpenRouter, que **não tem endpoint
-`/embeddings`**. O `EmbeddingService` tenta, falha e cai no fallback por hash
-— determinístico, mas sem semântica (busca vetorial vira quase ruído) e com
-um round-trip desperdiçado por chamada. Para embeddings reais é preciso uma
-chave OpenAI com `ai.base_url=https://api.openai.com/v1`; note que o mesmo
-par chave/base_url também serve o LLM de chat, então nesse caso configure o
-LLM pelas chaves nativas (`ANTHROPIC_API_KEY` / `GEMINI_API_KEY`), que entram
-na frente da chain.
+Chat e embedding compartilham o mesmo par chave/base_url: o
+`EmbeddingService` é construído com `cfg.AI.APIKey` + `cfg.AI.BaseURL` e o
+`cfg.Embedding.Model` (`cmd/server/main.go`). Não há como apontá-los para
+fornecedores diferentes sem mudar o código.
+
+Isso não é problema porque o OpenRouter serve `/api/v1/embeddings` além de
+`/chat/completions`, espelhando o schema da OpenAI — então o mesmo
+`ai.api_key` cobre os dois. O que precisa casar:
+
+- `embedding.model: openai/text-embedding-3-small` — id no formato do
+  OpenRouter (`vendor/modelo`), não o nome curto da OpenAI.
+- `embedding.dimensions: 1536` — é a dimensão desse modelo **e** a largura
+  das colunas `vector(1536)` criadas pela migração 8.
+
+Se a chave estiver inválida ou o modelo não existir, o `EmbeddingService`
+não quebra: loga `embedding API call failed, using hash fallback` e devolve
+um vetor por hash — determinístico, mas sem semântica. Ou seja, **busca
+vetorial ruim é sintoma de chave/modelo errados**, não de bug: procure esse
+WARN no log antes de investigar qualquer outra coisa.
 
 ## Layout
 
