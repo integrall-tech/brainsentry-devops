@@ -42,10 +42,7 @@ update_backend() {
   # arrastava o outro para uma versão que ninguém pediu.
   dc -f docker-compose.yml up -d --no-deps brainsentry-backend
   # Espera ficar healthy antes de migrar — migrate.sh lê /app/migrations dele.
-  for _ in $(seq 1 45); do
-    [[ "$(docker inspect --format '{{.State.Health.Status}}' brainsentry-backend 2>/dev/null)" == "healthy" ]] && break
-    sleep 2
-  done
+  wait_healthy brainsentry-backend
   "$SCRIPT_DIR/migrate.sh"
 }
 
@@ -55,6 +52,23 @@ update_frontend() {
   dc -f docker-compose.yml pull brainsentry-frontend
   # --no-deps pelo mesmo motivo do backend: isolar o componente pedido.
   dc -f docker-compose.yml up -d --no-deps brainsentry-frontend
+  # Esperar aqui também: sem isto o health-check do fim roda com o container
+  # ainda em "starting" e reporta FALHOU num deploy que deu certo — foi o que
+  # apareceu no log do primeiro CD automático.
+  wait_healthy brainsentry-frontend
+}
+
+# wait_healthy bloqueia até o container ficar healthy (ou ~90s). Não falha por
+# conta própria: quem decide é o health-check no fim, com diagnóstico melhor.
+wait_healthy() {
+  local name="$1" status=""
+  for _ in $(seq 1 45); do
+    status="$(docker inspect --format '{{.State.Health.Status}}' "$name" 2>/dev/null || echo missing)"
+    [[ "$status" == "healthy" ]] && return 0
+    sleep 2
+  done
+  echo "[deploy-component] aviso: $name não ficou healthy (último estado: $status)" >&2
+  return 0
 }
 
 case "$COMPONENT" in
