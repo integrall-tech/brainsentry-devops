@@ -12,14 +12,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate docker-compose.swarm.yml syntax
+      - name: Validate compose syntax (VPS + webhook + swarm)
         # `docker compose config` parses + resolves interpolation. We
         # pass a minimal .env so the variable substitution succeeds.
         # External resources (networks, secrets) don't need to exist
         # for the config check.
         run: |
           cp .env.example .env
-          docker compose -f docker-compose.swarm.yml --env-file .env config >/dev/null
+          docker compose -f docker-compose.yml         --env-file .env config >/dev/null
+          docker compose -f docker-compose.webhook.yml --env-file .env config >/dev/null
+          docker compose -f swarm/docker-compose.swarm.yml --env-file .env config >/dev/null
+
+      - name: Validate config/config.production.yaml is parseable YAML
+        run: python3 -c "import yaml,sys; yaml.safe_load(open('config/config.production.yaml'))"
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -30,5 +35,6 @@ jobs:
       - name: ShellCheck on every script
         uses: ludeeus/action-shellcheck@master
         with:
-          scandir: ./scripts
+          # Sem scandir: varre o repo inteiro, pegando scripts/ (alvo VPS) e
+          # swarm/scripts/ (alvo antigo) na mesma passada.
           severity: warning

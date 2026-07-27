@@ -1,40 +1,75 @@
 #!/usr/bin/env bash
-# Tear down the brainsentry stack. By default keeps volumes (data is
-# preserved). Pass --purge-volumes to also remove the brainsentry
-# postgres data volume (destructive — only for clean re-installs).
-
+# =============================================================================
+# undeploy.sh — derruba a stack brainsentry.
+#   scripts/undeploy.sh                 # para os containers (dados preservados)
+#   scripts/undeploy.sh --purge-graph   # apaga também o volume do FalkorDB
+#   scripts/undeploy.sh --purge-db      # DROPa o database no pg compartilhado
+#
+# O bloco do Caddy é removido em qualquer caso (senão sobra rota 502).
+# =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-# shellcheck disable=SC1091
-[ -f .env ] && source .env
-STACK_NAME="${STACK_NAME:-brainsentry}"
+ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
+# shellcheck disable=SC1090
+[[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; }
 
-PURGE=0
+PURGE_GRAPH=0
+PURGE_DB=0
 for arg in "$@"; do
-    [ "$arg" = "--purge-volumes" ] && PURGE=1
+  case "$arg" in
+    --purge-graph) PURGE_GRAPH=1 ;;
+    --purge-db)    PURGE_DB=1 ;;
+    *) echo "opção desconhecida: $arg" >&2; exit 2 ;;
+  esac
 done
 
-echo "[1/2] removing stack '${STACK_NAME}'..."
-docker stack rm "$STACK_NAME"
+dc() { docker compose --env-file "$ENV_FILE" "$@"; }
 
-echo "[2/2] waiting for cleanup..."
-for _ in $(seq 1 30); do
-    remaining=$(docker service ls --filter "label=com.docker.stack.namespace=${STACK_NAME}" -q | wc -l | tr -d ' ')
-    [ "$remaining" = "0" ] && break
-    sleep 1
-done
+echo "[undeploy] parando a stack…"
+if [[ "$PURGE_GRAPH" == "1" ]]; then
+  dc -f docker-compose.yml down -v   # -v apaga falkordb_data junto
+else
+  dc -f docker-compose.yml down
+fi
+dc -f docker-compose.webhook.yml down 2>/dev/null || true
 
-if [ "$PURGE" = "1" ]; then
-    echo
-    echo "[!] --purge-volumes — also removing brainsentry_postgres_data."
-    echo "    THIS DELETES THE BRAINSENTRY DATABASE. Ctrl-C in 5s to abort."
-    sleep 5
-    docker volume rm "${STACK_NAME}_brainsentry_postgres_data" 2>&1 || echo "  (volume already gone)"
+echo "[undeploy] removendo o bloco do Caddy…"
+CADDYFILE_HOST="${CADDYFILE_HOST:-/opt/bluevix/caddy/Caddyfile}"
+CADDY_CONTAINER="${CADDY_CONTAINER:-bluevix-caddy}"
+if [[ -f "$CADDYFILE_HOST" ]]; then
+  cp -a "$CADDYFILE_HOST" "${CADDYFILE_HOST}.brainsentry.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  TMP="$(mktemp)"
+  awk -v b="# >>> brainsentry >>>" -v e="# <<< brainsentry <<<" '
+    index($0,b)==1          {inblk=1; next}
+    inblk && index($0,e)==1 {inblk=0; next}
+    !inblk {print}
+  ' "$CADDYFILE_HOST" > "$TMP"
+  if docker exec -i "$CADDY_CONTAINER" caddy validate --adapter caddyfile --config - < "$TMP" >/dev/null 2>&1; then
+    cp "$TMP" "$CADDYFILE_HOST"
+    docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile
+    echo "  bloco removido e Caddy recarregado"
+  else
+    echo "  AVISO: Caddyfile resultante inválido — bloco NÃO removido ($TMP)" >&2
+  fi
 fi
 
-echo
-echo "Done. Re-deploy with: scripts/deploy.sh"
+if [[ "$PURGE_DB" == "1" ]]; then
+  PG_CONTAINER="${POSTGRES_ADMIN_CONTAINER:-bluevix-postgres}"
+  PG_ADMIN="${POSTGRES_ADMIN_USER:-bluevix}"
+  DB_NAME="${BRAINSENTRY_DB_NAME:-brainsentry}"
+  echo "ATENÇÃO: isto APAGA o database '${DB_NAME}' e todos os dados."
+  read -r -p "Digite 'apagar' para confirmar: " answer
+  if [[ "$answer" == "apagar" ]]; then
+    docker exec -i "$PG_CONTAINER" psql -U "$PG_ADMIN" -d postgres \
+      -c "DROP DATABASE IF EXISTS \"${DB_NAME}\" WITH (FORCE);" >/dev/null
+    echo "  database removido"
+  else
+    echo "  abortado (database preservado)"
+  fi
+fi
+
+echo "[undeploy] ok"

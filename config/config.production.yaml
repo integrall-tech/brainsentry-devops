@@ -1,0 +1,104 @@
+# Baseline NÃO-SECRETO do backend em produção. Montado em /app/config.yaml.
+#
+# Regra de ouro: tudo que é credencial ou hostname fica no .env (compose) —
+# applyEnvOverrides (internal/config/config.go) sobrepõe este arquivo. Aqui
+# vivem só os knobs que NÃO têm variável de ambiente equivalente.
+#
+# Os campos abaixo com valor de placeholder (senhas vazias, jwt_secret) são
+# sempre substituídos pelo env; ficam aqui só porque o YAML precisa da chave.
+
+server:
+  port: 8081
+  context_path: /api
+  shutdown_timeout: 30s
+  # Sobreposto por BRAINSENTRY_ENV=production no compose. Em production o boot
+  # RECUSA jwt_secret default e demo_auth_enabled=true (fail-closed).
+  environment: production
+
+database:
+  host: bluevix-postgres
+  port: 5432
+  name: brainsentry
+  user: brainsentry
+  password: ""      # ← DB_PASSWORD
+  sslmode: disable  # ← DB_SSLMODE (pg compartilhado não tem TLS; rede docker)
+  max_connections: 20
+  min_connections: 5
+
+redis:
+  host: bluevix-redis
+  port: 6379
+  password: ""
+  # IMPORTANTE: não existe env override para redis.db. O bluevix usa db 0 no
+  # MESMO Redis — sem este isolamento as chaves colidiriam (rate-limit, cache
+  # de embeddings, scheduler). Mudar aqui exige redeploy do backend.
+  db: 3
+
+falkordb:
+  host: brainsentry-falkordb
+  port: 6379
+  password: ""
+  graph_name: brainsentry
+
+security:
+  jwt_secret: ""    # ← JWT_SECRET (production recusa vazio/default)
+  jwt_expiration: 24h
+  bcrypt_cost: 12
+  # Em production o Validate() recusa true. Explícito para não haver dúvida.
+  demo_auth_enabled: false
+  cors:
+    # Sobreposto por CORS_ORIGINS. O SPA é same-origin (nginx faz proxy de
+    # /api), então isto só importa para consumidores externos da API.
+    allowed_origins:
+      - "https://app.brainsentry.com.br"
+    allowed_methods: [GET, POST, PUT, DELETE, OPTIONS, PATCH]
+
+tenant:
+  default_id: "a9f814d2-4dae-41f3-851b-8aa3d4706561"
+
+ai:
+  provider: openrouter
+  # Escolhido por medição, não por gosto — ver scripts/bench-llm.sh.
+  # O backend faz json.Unmarshal direto na resposta, e max_tokens=500 é o
+  # orçamento TOTAL. Modelos de raciocínio gastam esse orçamento pensando e
+  # devolvem JSON truncado: com uma conversa de ~6000 chars (o teto do
+  # CompressionService), openai/gpt-oss-120b queimou 397 tokens em raciocínio
+  # e falhou 3/3, custando 3 retries e ~45s por memória. gemini-2.5-flash-lite
+  # faz 3/3 em ~2s por US$0,35/1000 chamadas.
+  # Antes de trocar este valor: ./scripts/bench-llm.sh <modelo-novo>
+  model: "google/gemini-2.5-flash-lite"  # ← AI_MODEL
+  api_key: ""                            # ← BRAINSENTRY_AI_AGENTIC_MODEL_API_KEY
+  base_url: "https://openrouter.ai/api/v1"
+  temperature: 0.2
+  # Orçamento total (raciocínio + resposta). Subir isto é a alternativa a
+  # trocar de modelo, mas custa em toda chamada — medir antes.
+  max_tokens: 500
+  timeout: 60s
+  max_retries: 3
+
+embedding:
+  # O EmbeddingService usa ai.api_key + ai.base_url (não tem credencial
+  # própria), e o OpenRouter serve /embeddings além de /chat/completions —
+  # então a mesma chave cobre chat e embedding. O id segue o formato do
+  # OpenRouter (vendor/modelo), não o nome curto da OpenAI.
+  #
+  # ATENÇÃO na dimensão — 1536 e não os 384 do dev: é o tamanho do
+  # text-embedding-3-small E a largura das colunas vector(1536) que a
+  # migração 8 cria em decisions/events. Com 384 todo INSERT nessas tabelas
+  # falharia. Vale também para o fallback por hash, que respeita este valor.
+  model: "openai/text-embedding-3-small"
+  dimensions: 1536
+
+interception:
+  quick_check_enabled: true
+  deep_analysis_enabled: true
+  relevance_threshold: 0.7
+
+memory:
+  auto_capture: true
+  auto_importance: true
+  obsolescence_days: 90
+
+logging:
+  level: info
+  format: json

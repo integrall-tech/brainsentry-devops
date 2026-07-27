@@ -1,86 +1,94 @@
 #!/usr/bin/env bash
-# Deploy or update the brainsentry swarm stack. Assumes:
-#  - dev-env-devops is already deployed (provides the 'devops' overlay
-#    network and the redis_password + falkordb_password swarm secrets)
-#  - scripts/setup-secrets.sh has been run at least once
-#  - .env exists (copy from .env.example and edit)
+# =============================================================================
+# deploy.sh — sobe/atualiza a stack brainsentry na VPS.
+#   1) role+db+pgvector no Postgres compartilhado
+#   2) sobe falkordb + backend + frontend
+#   3) migrações (os .sql vêm de dentro da imagem do backend)
+#   4) admin inicial (idempotente)
+#   5) roteamento no Caddy compartilhado
+# Uso:
+#   scripts/deploy.sh              # sobe tudo
+#   scripts/deploy.sh --no-migrate # pula as migrações
 #
-# Run from the swarm manager node.
-
+# O CD contínuo é por PULL (scripts/watch-ghcr.sh no cron), não por webhook —
+# ver a explicação lá.
+# =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-if [ ! -f ".env" ]; then
-    echo "[fail] .env not found — copy .env.example and edit" >&2
-    exit 1
-fi
-
-# Auto-export every var from .env so `docker stack deploy` (which reads
-# from process env, not the .env file directly like `docker compose`
-# does) sees BACKEND_IMAGE_TAG / GHCR_* / etc. Without `set -a` the
-# vars are shell-local and the compose file's ${VAR:-default} falls
-# back to the defaults silently — we hit this in production where
-# `:latest` got pulled instead of the pinned `:0.1.0`.
-# shellcheck disable=SC1091
-set -a
-source .env
-set +a
-STACK_NAME="${STACK_NAME:-brainsentry}"
-
-# Sanity: external resources must exist before stack deploy can attach.
-echo "[1/5] checking external resources from dev-env-devops..."
-if ! docker network inspect devops_devops >/dev/null 2>&1; then
-    echo "[fail] external network 'devops_devops' not found" >&2
-    echo "       Deploy dev-env-devops first: cd ../dev-env-devops && scripts/deploy.sh" >&2
-    exit 1
-fi
-for s in devops_redis_password devops_falkordb_password; do
-    if ! docker secret inspect "$s" >/dev/null 2>&1; then
-        echo "[fail] external secret '$s' not found" >&2
-        echo "       Deploy dev-env-devops first." >&2
-        exit 1
-    fi
+ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
+DO_MIGRATE=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-migrate) DO_MIGRATE=0 ;;
+    *) echo "opção desconhecida: $arg" >&2; exit 2 ;;
+  esac
 done
 
-# Sanity: our local secrets must be on disk for swarm to read them.
-echo "[2/5] checking brainsentry secrets on disk..."
-for s in brainsentry_postgres_password brainsentry_jwt_secret brainsentry_llm_api_key; do
-    if [ ! -s "secrets/${s}.txt" ]; then
-        echo "[fail] secrets/${s}.txt missing — run scripts/setup-secrets.sh first" >&2
-        exit 1
-    fi
+dc() { docker compose --env-file "$ENV_FILE" "$@"; }
+
+echo "==================================================================="
+echo " brainsentry — deploy (docker compose, VPS)"
+echo "==================================================================="
+
+[[ -f "$ENV_FILE" ]] || { echo "FATAL: $ENV_FILE ausente. Rode scripts/setup.sh antes." >&2; exit 1; }
+# shellcheck disable=SC1090
+set -a; source "$ENV_FILE"; set +a
+
+# Pré-requisitos da VPS: as redes e o Caddy do bluevix.
+for net in bluevix_web bluevix_internal; do
+  docker network inspect "$net" >/dev/null 2>&1 \
+    || { echo "FATAL: rede $net não existe (a stack bluevix está no ar?)." >&2; exit 1; }
 done
 
-# Optional: GHCR login if packages are private.
-if [ -n "${GHCR_TOKEN:-}" ] && [ -n "${GHCR_USERNAME:-}" ]; then
-    echo "[3/5] logging in to ghcr.io..."
-    echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+echo "[1/5] Garantindo role/database/pgvector no Postgres compartilhado…"
+"$SCRIPT_DIR/ensure-db.sh"
+
+echo "[2/5] Baixando imagens e subindo a stack…"
+dc -f docker-compose.yml pull
+dc -f docker-compose.yml up -d --remove-orphans
+
+echo "[3/5] Aguardando health do backend…"
+status=""
+for _ in $(seq 1 45); do
+  status="$(docker inspect --format '{{.State.Health.Status}}' brainsentry-backend 2>/dev/null || echo starting)"
+  [[ "$status" == "healthy" ]] && break
+  printf "."; sleep 2
+done
+echo " ${status:-?}"
+if [[ "$status" != "healthy" ]]; then
+  echo "AVISO: backend não ficou healthy. Últimas linhas do log:" >&2
+  docker logs --tail 40 brainsentry-backend 2>&1 | sed 's/^/  /' >&2
 fi
 
-echo "[4/5] deploying stack '${STACK_NAME}'..."
-docker stack deploy \
-    --compose-file docker-compose.swarm.yml \
-    --with-registry-auth \
-    "$STACK_NAME"
+if [[ "$DO_MIGRATE" == "1" ]]; then
+  echo "[4/5] Aplicando migrações…"
+  "$SCRIPT_DIR/migrate.sh"
+  echo "      admin inicial…"
+  "$SCRIPT_DIR/seed-admin.sh"
+  # O backend abre o pool antes das migrações existirem no primeiro deploy;
+  # reiniciar garante que ele enxergue o schema já pronto.
+  dc -f docker-compose.yml restart brainsentry-backend >/dev/null
+  # O FalkorDB é cache derivado e o backend NUNCA escreve nele em operação
+  # normal — sem este passo, /v1/graph/* responde com um grafo vazio depois
+  # de um deploy novo. Ver scripts/rebuild-graph.sh (precisa de cron também).
+  echo "      reconstruindo o grafo…"
+  sleep 5   # o backend precisa estar de pé para o docker exec
+  "$SCRIPT_DIR/rebuild-graph.sh" || echo "AVISO: rebuild do grafo falhou (não bloqueia o deploy)" >&2
+else
+  echo "[4/5] (migrações puladas por --no-migrate)"
+fi
 
-echo "[5/5] waiting for services to converge..."
-for svc in brainsentry-postgres brainsentry-backend brainsentry-frontend; do
-    full="${STACK_NAME}_${svc}"
-    for _ in $(seq 1 60); do
-        replicas=$(docker service ls --filter "name=${full}" --format "{{.Replicas}}" 2>/dev/null || echo "")
-        if [ "$replicas" = "1/1" ]; then
-            echo "  [ok]   ${full}"
-            break
-        fi
-        sleep 2
-    done
-    if [ "$replicas" != "1/1" ]; then
-        echo "  [warn] ${full} not converged after 120s; check with: docker service ps ${full}" >&2
-    fi
-done
+echo "[5/5] Sincronizando roteamento no Caddy compartilhado…"
+"$SCRIPT_DIR/caddy-sync.sh"
+
+docker image prune -f >/dev/null 2>&1 || true
 
 echo
-echo "Done. Verify with: scripts/health-check.sh"
+echo "Deploy concluído:"
+docker ps --format "table {{.Names}}\t{{.Status}}" | grep -E "brainsentry|NAMES" || true
+echo
+"$SCRIPT_DIR/health-check.sh" || true

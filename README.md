@@ -1,186 +1,219 @@
 # brainsentry-devops
 
-Deploy infrastructure for **brainsentry** on the Integrall DevOps swarm.
-Hybrid topology: brings its own Postgres (pgvector required) and reuses
-Redis + FalkorDB from `dev-env-devops`.
+Deploy do **brainsentry** em produção.
 
-## Topology
+Dois alvos, dois arquivos:
+
+| Alvo | Arquivo | Quando usar |
+| --- | --- | --- |
+| **VPS 31.97.240.217** (docker compose) | `docker-compose.yml` | **É este.** Produção em `brainsentry.com.br`. |
+| Swarm Integrall (`dev-env-devops`) | `swarm/docker-compose.swarm.yml` | Cluster antigo; mantido para referência — ver [swarm/](swarm/). |
+
+O resto deste README é sobre o alvo VPS.
+
+## Topologia
+
+A VPS não usa Swarm: cada app é um projeto compose e existe **um Caddy
+compartilhado** (`bluevix-caddy`) que termina TLS e roteia por hostname. O
+brainsentry segue essa convenção e **reaproveita** o que já está no ar,
+subindo só o que ninguém mais provê.
 
 ```
-┌─────────────── DevOps swarm (dev-env-devops) ────────────────────┐
-│                                                                  │
-│   ┌─ redis ─────┐    ┌─ falkordb ──┐    ┌─ litellm (opt) ──┐    │
-│   │ shared      │    │ shared      │    │ shared           │    │
-│   └─────────────┘    └─────────────┘    └──────────────────┘    │
-│         ▲                  ▲                                     │
-│         │                  │      [overlay network: devops_devops]│
-│  ┌──────┴──────────────────┴──────────────────────────────────┐  │
-│  │                       brainsentry stack                     │  │
-│  │  ┌─ brainsentry-postgres ─┐  ┌─ brainsentry-backend ─┐     │  │
-│  │  │ pgvector/pgvector:pg18 │  │ ghcr.io/integrall-tech│     │  │
-│  │  │ DEDICATED to this app  │◀─│  /brainsentry-backend │     │  │
-│  │  │ port 5445 (host)       │  │ port 8081 (host)      │     │  │
-│  │  └────────────────────────┘  └────────┬──────────────┘     │  │
-│  │                                       │                     │  │
-│  │  ┌─ brainsentry-frontend ──────────┐  │                     │  │
-│  │  │ ghcr.io/integrall-tech/         │  │ nginx /api/* proxy  │  │
-│  │  │   brainsentry-frontend          │──┘                     │  │
-│  │  │ port 8086 (host)                │                        │  │
-│  │  └─────────────────────────────────┘                        │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
+                    Internet :443
+                          │
+              ┌───────────▼────────────┐
+              │  bluevix-caddy (TLS)   │   /opt/bluevix/caddy/Caddyfile
+              └───┬───────────┬────────┘   ← bloco gerenciado por caddy-sync.sh
+   app.brainsentry│           │api.brainsentry.com.br
+      .com.br     │           │
+      ┌───────────▼──┐     ┌──▼──────────────────┐
+      │ brainsentry- │     │ brainsentry-backend │  Go, :8081
+      │  frontend    │────▶│  (nginx /api proxy) │
+      │  nginx :80   │     └──┬───────┬──────┬───┘
+      └──────────────┘        │       │      │
+                              │       │      └──▶ brainsentry-falkordb  ← NOSSO
+                              │       │           (rede privada bsnet)
+                              │       └─────────▶ bluevix-redis  (db 3)  ← reusado
+                              └─────────────────▶ bluevix-postgres       ← reusado
+                                                  db/role "brainsentry"
 ```
 
-| Service               | Image                                              | Port | Owns                          |
-| --------------------- | -------------------------------------------------- | ---- | ----------------------------- |
-| brainsentry-postgres  | `pgvector/pgvector:pg18`                           | 5445 | DB + brainsentry_postgres_data volume |
-| brainsentry-backend   | `ghcr.io/integrall-tech/brainsentry-backend:latest`| 8081 | API (Go)                      |
-| brainsentry-frontend  | `ghcr.io/integrall-tech/brainsentry-frontend:latest`| 8086 | SPA (React + nginx)           |
+| Recurso | De onde vem | Observação |
+| --- | --- | --- |
+| TLS + roteamento | `bluevix-caddy` (existente) | bloco em `caddy/brainsentry.caddy` |
+| Postgres + pgvector | `bluevix-postgres` (existente) | role/database dedicados `brainsentry` |
+| Redis | `bluevix-redis` (existente) | **db 3** — o bluevix usa o db 0 |
+| FalkorDB | **container desta stack** | nada na VPS provia grafo |
+| Backend / Frontend | `ghcr.io/integrall-tech/brainsentry-*` | imagens públicas, buildadas pelo CI do repo da app |
 
-External dependencies (live in `dev-env-devops`):
+### Hostnames
 
-- `redis` — cache, rate-limit, scheduler
-- `falkordb` — graph features (`/v1/graph/*`)
-- `devops_devops` overlay network — how this stack reaches the above
-- `devops_redis_password` + `devops_falkordb_password` swarm secrets
+| Host | Destino |
+| --- | --- |
+| `app.brainsentry.com.br` | SPA (o nginx interno faz proxy de `/api/*` → backend) |
+| `api.brainsentry.com.br` | backend direto — agentes MCP, CLI, TUI |
+| `brainsentry.com.br`, `www.` | redirect 301 → `app.` |
 
-## Prerequisites
+O CD não expõe host nenhum: é por pull (ver abaixo).
 
-1. `dev-env-devops` deployed and healthy. The overlay network and the
-   `redis_password` / `falkordb_password` swarm secrets must exist.
-2. Docker Swarm initialized on the manager node.
-3. `psql` is NOT required on the host — `scripts/migrate.sh` runs all
-   `psql` invocations inside the postgres container.
-4. (Optional) the `brainsentry.io` source repo cloned next to this one
-   if you want to run `scripts/smoke-test.sh`.
+## Instalação do zero
 
-## First-time install
+Tudo roda **na VPS**, em `/opt/brainsentry-devops`:
 
 ```bash
-# 1. Configure
-cp .env.example .env        # then edit (image tags, AI model, etc)
+# 1. Configuração + segredos (idempotente: não sobrescreve o que já existe)
+./scripts/setup.sh
+$EDITOR .env          # preencha BRAINSENTRY_AI_AGENTIC_MODEL_API_KEY
 
-# 2. Generate secrets we own (postgres pw, JWT, LLM key)
-./scripts/setup-secrets.sh   # prompts for the LLM key
+# 2. DNS na Cloudflare (A records → 31.97.240.217, proxy DESLIGADO)
+./scripts/dns-sync.sh --dry-run
+./scripts/dns-sync.sh
 
-# 3. Deploy the stack (pulls images, attaches to overlay)
+# 3. Deploy: db + stack + migrações + admin + grafo + Caddy
 ./scripts/deploy.sh
 
-# 4. Apply the 9 migrations (creates the schema, installs pgvector)
-./scripts/migrate.sh
-
-# 5. Verify
+# 4. Verificação
 ./scripts/health-check.sh
 ```
 
-If everything went well:
+O `deploy.sh` é idempotente — é o mesmo comando para instalar e para
+atualizar.
+
+> **Por que o proxy da Cloudflare fica desligado:** o Caddy emite o
+> certificado por HTTP-01, que exige que a porta 80 do domínio chegue até a
+> VPS. Com o proxy laranja ligado, a Cloudflare termina o TLS antes e o
+> desafio nunca chega — o host passa a responder 525/526.
+
+## Operação do dia a dia
 
 ```bash
-curl http://localhost:8081/api/version
-# {"version":"0.1.0","commit":"<sha>","buildTime":"..."}
-
-open http://localhost:8086/    # the SPA
+./scripts/health-check.sh                     # containers + API + HTTPS
+./scripts/deploy-component.sh backend sha-abc1234   # sobe uma tag específica
+./scripts/deploy-component.sh all v0.2.0
+./scripts/migrate.sh                          # migrações após um release
+./scripts/seed-admin.sh --reset               # redefine a senha do admin
+./scripts/backup-db.sh                        # → ./backups/*.sql.gz
+./scripts/restore-db.sh ./backups/<arquivo>   # DESTRUTIVO
+./scripts/caddy-sync.sh                       # só o roteamento
+./scripts/undeploy.sh                         # para tudo (dados preservados)
+./scripts/undeploy.sh --purge-graph --purge-db  # wipe completo
 ```
 
-## Day 2 operations
+Os três cron da VPS (`crontab -l`):
 
-> **Upgrading to a new version?** Follow [docs/RELEASE.md](docs/RELEASE.md).
-> There's an ordering gotcha (update backend → migrate → update frontend,
-> because `migrate.sh` reads the migrations from inside the backend image)
-> — the guide explains why and gives a step-by-step + checklist.
+```cron
+0  3 * * * cd /opt/brainsentry-devops && ./scripts/backup-db.sh    >> /var/log/bs-backup.log 2>&1
+30 3 * * * cd /opt/brainsentry-devops && ./scripts/rebuild-graph.sh >> /var/log/bs-rebuild.log 2>&1
+*/3 * * * * cd /opt/brainsentry-devops && ./scripts/watch-ghcr.sh   >> /var/log/bs-watch.log 2>&1
+```
+
+O do meio não é opcional: o backend nunca escreve no FalkorDB em runtime, então
+sem ele `/v1/graph/*` congela no último rebuild.
+
+> **Upgrade de versão:** há uma ordem obrigatória (backend → migrate →
+> frontend), porque os `.up.sql` viajam **dentro da imagem do backend**.
+> `deploy-component.sh` já faz isso; o porquê está em
+> [docs/RELEASE.md](docs/RELEASE.md).
+
+## CD (deploy automático) — por pull
+
+A VPS consulta o GHCR e se atualiza sozinha. Nada é exposto para isso: não há
+webhook, token de deploy nem host `deploy.*`.
 
 ```bash
-# Update to a newer image tag (edit .env then redeploy)
-./scripts/deploy.sh
-
-# Apply a new migration after a backend release
-./scripts/migrate.sh
-
-# Full integration smoke (uses brain-sentry-explorer from the source repo)
-./scripts/smoke-test.sh
-
-# Backup the DB
-./scripts/backup-db.sh             # → ./backups/brainsentry-YYYYMMDD-HHMMSS.sql.gz
-
-# Cron the daily backup (manager node)
-echo "0 3 * * * cd $(pwd) && ./scripts/backup-db.sh >> /var/log/bs-backup.log 2>&1" \
-  | crontab -
-
-# Restore from a backup (DESTRUCTIVE)
-./scripts/restore-db.sh ./backups/brainsentry-20260601-030000.sql.gz
-
-# Tear down (keeps data volume)
-./scripts/undeploy.sh
-
-# Tear down + delete data (clean reinstall)
-./scripts/undeploy.sh --purge-volumes
+./scripts/watch-ghcr.sh --dry-run   # diz o que faria
+./scripts/watch-ghcr.sh             # atualiza o que mudou
 ```
 
-## Environment knobs
+Cron (a cada 3 minutos):
 
-See `.env.example` for the full list. The most-used:
-
-| Variable                     | Default                          | Meaning                              |
-| ---------------------------- | -------------------------------- | ------------------------------------ |
-| `STACK_NAME`                 | `brainsentry`                    | Swarm stack name (prefix for services + secrets) |
-| `BACKEND_IMAGE_TAG`          | `latest`                         | Pin to `v0.1.0` in production for reproducibility |
-| `FRONTEND_IMAGE_TAG`         | `latest`                         | Same as above                        |
-| `BRAINSENTRY_BACKEND_PORT`   | `8081`                           | Host port for the API                |
-| `BRAINSENTRY_FRONTEND_PORT`  | `8086`                           | Host port for the SPA                |
-| `BRAINSENTRY_POSTGRES_PORT`  | `5445`                           | Host port for direct DB access       |
-| `BRAINSENTRY_AI_MODEL`       | `anthropic/claude-haiku-4-5`     | OpenRouter (or LiteLLM) model id     |
-| `BRAINSENTRY_CORS_ORIGINS`   | localhost + integrall.tech       | Comma-separated allowed origins      |
-| `GHCR_USERNAME`/`GHCR_TOKEN` | (empty)                          | Only needed if brainsentry packages are private |
-
-## LiteLLM as LLM provider (alternative to OpenRouter direct)
-
-Override two env vars on `brainsentry-backend` and ship the LiteLLM
-master key in the LLM secret:
-
-```yaml
-- AI_BASE_URL=http://litellm:4000/v1
-- AI_MODEL=<the model name configured in dev-env-devops's litellm/config.yaml>
+```bash
+*/3 * * * * cd /opt/brainsentry-devops && ./scripts/watch-ghcr.sh >> /var/log/bs-watch.log 2>&1
 ```
 
-Then in `secrets/brainsentry_llm_api_key.txt`, put the LiteLLM master key
-instead of the OpenRouter PAT.
+Compara o ID da imagem `:main` no GHCR com o que o container roda; quando
+diverge, deriva a tag imutável `sha-<short>` do label
+`org.opencontainers.image.revision` e chama o `deploy-component.sh`. Assim o
+`.env` registra o commit exato, não um ponteiro que se move. Backend antes do
+frontend, como o `docs/RELEASE.md` exige.
 
-## Repository layout
+> **Por que pull e não webhook.** O desenho anterior tinha o runner do GitHub
+> chamando `deploy.brainsentry.com.br`, e essa direção não é confiável aqui:
+> 5 tentativas de connect em 2 minutos deram timeout enquanto a mesma URL
+> respondia em 0,098s de outra origem — e a VPS alcança o GHCR em 0,03s. O SYN
+> não chega na máquina (fail2ban sem banidos, `INPUT ACCEPT`, nada nos logs do
+> Caddy), então o bloqueio é upstream, provavelmente proteção do provedor
+> contra faixas de datacenter — e runners do GitHub são Azure. Retry não
+> resolve rota bloqueada; inverter a direção resolve.
+
+## Configuração
+
+Credenciais e hosts ficam no `.env` (ver `.env.example`); o que **não tem
+variável de ambiente equivalente** fica em `config/config.production.yaml`,
+montado em `/app/config.yaml`. Env sempre vence sobre o arquivo
+(`internal/config/applyEnvOverrides`).
+
+Dois valores que só existem no arquivo e importam:
+
+- **`redis.db: 3`** — o Redis é compartilhado com o bluevix (db 0). Sem isso
+  as chaves colidem.
+- **`embedding.dimensions: 1536`** — a migração 8 cria `vector(1536)`; com os
+  384 do dev, todo INSERT em `decisions`/`events` falharia.
+
+### Embeddings
+
+Chat e embedding compartilham o mesmo par chave/base_url: o
+`EmbeddingService` é construído com `cfg.AI.APIKey` + `cfg.AI.BaseURL` e o
+`cfg.Embedding.Model` (`cmd/server/main.go`). Não há como apontá-los para
+fornecedores diferentes sem mudar o código.
+
+Isso não é problema porque o OpenRouter serve `/api/v1/embeddings` além de
+`/chat/completions`, espelhando o schema da OpenAI — então o mesmo
+`ai.api_key` cobre os dois. O que precisa casar:
+
+- `embedding.model: openai/text-embedding-3-small` — id no formato do
+  OpenRouter (`vendor/modelo`), não o nome curto da OpenAI.
+- `embedding.dimensions: 1536` — é a dimensão desse modelo **e** a largura
+  das colunas `vector(1536)` criadas pela migração 8.
+
+Se a chave estiver inválida ou o modelo não existir, o `EmbeddingService`
+não quebra: loga `embedding API call failed, using hash fallback` e devolve
+um vetor por hash — determinístico, mas sem semântica. Ou seja, **busca
+vetorial ruim é sintoma de chave/modelo errados**, não de bug: procure esse
+WARN no log antes de investigar qualquer outra coisa.
+
+## Layout
 
 ```
 brainsentry-devops/
-├── README.md                    (this file)
-├── .env.example                 (env vars; copy to .env to customize)
-├── docker-compose.swarm.yml     (the 3 services + secrets + network)
-├── scripts/
-│   ├── setup-secrets.sh         (generate the 3 owned secrets)
-│   ├── deploy.sh                (validate prereqs + stack deploy + converge wait)
-│   ├── undeploy.sh              (stack rm; --purge-volumes for clean wipe)
-│   ├── migrate.sh               (CREATE EXTENSION + 9 migrations via psql-in-container)
-│   ├── health-check.sh          (curl /api/health + /api/version + frontend)
-│   ├── smoke-test.sh            (run brain-sentry-explorer validate against live)
-│   ├── backup-db.sh             (pg_dump + gzip; auto-rotates by mtime)
-│   └── restore-db.sh            (gunzip + psql; destructive — drops DB first)
-├── secrets/                     (gitignored; setup-secrets.sh fills it)
-├── config/                      (placeholders for future overrides)
-└── docs/                        (deeper ops/troubleshooting docs)
+├── docker-compose.yml            falkordb + backend + frontend
+├── .env.example
+├── caddy/brainsentry.caddy       bloco do Caddy compartilhado
+├── config/config.production.yaml montado em /app/config.yaml
+├── scripts/                      setup, ensure-db, deploy, migrate, watch-ghcr, …
+├── docs/                         RELEASE, runbook, dns
+└── swarm/                        alvo antigo (Swarm Integrall)
 ```
 
 ## Troubleshooting
 
-- **`network devops_devops not found`** — `dev-env-devops` isn't
-  deployed. Deploy it first: `cd ../dev-env-devops && scripts/deploy.sh`.
-- **`secret devops_redis_password not found`** — same as above.
-- **Backend log: `relation "decisions" does not exist`** — migration 8
-  hasn't run. `./scripts/migrate.sh`.
-- **Backend log: `compression parse failed`** — the configured LLM is
-  returning malformed JSON. Switch `BRAINSENTRY_AI_MODEL` to
-  `anthropic/claude-haiku-4-5` or `google/gemini-2.5-flash` (these
-  produce reliable JSON; `deepseek/*` and others tend not to).
-- **Frontend `/api/...` 502** — backend isn't healthy yet. Watch
-  `docker service logs brainsentry_brainsentry-backend`.
-- **`docker stack deploy` says "image cannot be accessed"** — the
-  brainsentry GHCR packages are private; either make them public on
-  github.com/orgs/integrall-tech/packages or set `GHCR_USERNAME` +
-  `GHCR_TOKEN` in `.env` so `scripts/deploy.sh` logs in first AND uses
-  `--with-registry-auth` to propagate the credential to workers.
+- **`https://app.…` responde 525/526** — proxy da Cloudflare ligado. Desligue
+  (`./scripts/dns-sync.sh` já grava `proxied=false`).
+- **Caddy não emite certificado** — DNS ainda não propagou, ou a porta 80 não
+  chega. `dig +short app.brainsentry.com.br` e
+  `docker logs bluevix-caddy --tail 50`.
+- **`/api/...` 502 no SPA** — backend não está healthy:
+  `docker logs brainsentry-backend --tail 50`.
+- **Backend recusa subir com "production requires a real security.jwt_secret"**
+  — `JWT_SECRET` vazio/curto no `.env` (mínimo 32 chars). É fail-closed de
+  propósito.
+- **`relation "decisions" does not exist`** — faltou `./scripts/migrate.sh`.
+- **`extensão pgvector ausente`** — rode `./scripts/ensure-db.sh` (o
+  `CREATE EXTENSION` exige superusuário, por isso não está nas migrações).
+- **`compression parse failed: unexpected end of JSON input`** — o modelo é de
+  raciocínio e gastou o `ai.max_tokens` pensando antes de escrever o JSON, que
+  chega truncado. Sintomas colaterais: `POST /v1/memories` levando 20-45s (são
+  3 retries) e 502 no Caddy. Meça antes de escolher o substituto:
+  `./scripts/bench-llm.sh <modelo>` — a coluna `RACIOCINIO` é o diagnóstico.
+- **Grafo vazio depois de um restore** — o FalkorDB é derivado:
+  `docker exec brainsentry-backend /app/brainsentry --rebuild graph,embeddings,communities`.
