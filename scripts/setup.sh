@@ -45,7 +45,6 @@ fill() {
 fill JWT_SECRET                          "$(openssl rand -hex 32)" "64 hex chars"
 fill BRAINSENTRY_DB_PASSWORD             "$(openssl rand -hex 16)" "32 hex chars"
 fill FALKORDB_PASSWORD                   "$(openssl rand -hex 16)" "32 hex chars"
-fill DEPLOY_TOKEN                        "$(openssl rand -hex 24)" "48 hex chars"
 fill BRAINSENTRY_ADMIN_PASSWORD          "$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)" "senha do admin"
 
 chmod 600 "$ENV_FILE"

@@ -61,4 +61,4 @@ fi
 echo "[caddy-sync] recarregando Caddy…"
 docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile
 
-echo "[caddy-sync] ok — hosts: app.$ROOT_DOMAIN, api.$ROOT_DOMAIN, $ROOT_DOMAIN (redir), deploy.$ROOT_DOMAIN"
+echo "[caddy-sync] ok — hosts: app.$ROOT_DOMAIN, api.$ROOT_DOMAIN, $ROOT_DOMAIN + www (redir)"

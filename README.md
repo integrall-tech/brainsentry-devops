@@ -53,7 +53,8 @@ subindo só o que ninguém mais provê.
 | `app.brainsentry.com.br` | SPA (o nginx interno faz proxy de `/api/*` → backend) |
 | `api.brainsentry.com.br` | backend direto — agentes MCP, CLI, TUI |
 | `brainsentry.com.br`, `www.` | redirect 301 → `app.` |
-| `deploy.brainsentry.com.br` | receiver de CD (exige header `X-Deploy-Token`) |
+
+O CD não expõe host nenhum: é por pull (ver abaixo).
 
 ## Instalação do zero
 
@@ -68,8 +69,8 @@ $EDITOR .env          # preencha BRAINSENTRY_AI_AGENTIC_MODEL_API_KEY
 ./scripts/dns-sync.sh --dry-run
 ./scripts/dns-sync.sh
 
-# 3. Deploy: db + stack + migrações + admin + Caddy (+ CD)
-./scripts/deploy.sh --webhook
+# 3. Deploy: db + stack + migrações + admin + grafo + Caddy
+./scripts/deploy.sh
 
 # 4. Verificação
 ./scripts/health-check.sh
@@ -98,31 +99,52 @@ atualizar.
 ./scripts/undeploy.sh --purge-graph --purge-db  # wipe completo
 ```
 
-Backup diário (na VPS):
+Os três cron da VPS (`crontab -l`):
 
-```bash
-echo "0 3 * * * cd /opt/brainsentry-devops && ./scripts/backup-db.sh >> /var/log/bs-backup.log 2>&1" | crontab -
+```cron
+0  3 * * * cd /opt/brainsentry-devops && ./scripts/backup-db.sh    >> /var/log/bs-backup.log 2>&1
+30 3 * * * cd /opt/brainsentry-devops && ./scripts/rebuild-graph.sh >> /var/log/bs-rebuild.log 2>&1
+*/3 * * * * cd /opt/brainsentry-devops && ./scripts/watch-ghcr.sh   >> /var/log/bs-watch.log 2>&1
 ```
+
+O do meio não é opcional: o backend nunca escreve no FalkorDB em runtime, então
+sem ele `/v1/graph/*` congela no último rebuild.
 
 > **Upgrade de versão:** há uma ordem obrigatória (backend → migrate →
 > frontend), porque os `.up.sql` viajam **dentro da imagem do backend**.
 > `deploy-component.sh` já faz isso; o porquê está em
 > [docs/RELEASE.md](docs/RELEASE.md).
 
-## CD (deploy automático)
+## CD (deploy automático) — por pull
 
-O receiver (`brainsentry-webhook`) escuta em `deploy.brainsentry.com.br` e
-dispara `scripts/deploy-component.sh`. Do CI, depois que a imagem subiu:
+A VPS consulta o GHCR e se atualiza sozinha. Nada é exposto para isso: não há
+webhook, token de deploy nem host `deploy.*`.
 
 ```bash
-curl -fsS https://deploy.brainsentry.com.br/hooks/deploy \
-  -H "X-Deploy-Token: $DEPLOY_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"component":"backend","tag":"sha-abc1234"}'
+./scripts/watch-ghcr.sh --dry-run   # diz o que faria
+./scripts/watch-ghcr.sh             # atualiza o que mudou
 ```
 
-`component` ∈ `backend | frontend | all`. Token inválido → 403. Chamadas
-concorrentes são serializadas com `flock` e coalescem no último `tag`
-(latest-wins). Log em `/tmp/brainsentry-deploy.log`.
+Cron (a cada 3 minutos):
+
+```bash
+*/3 * * * * cd /opt/brainsentry-devops && ./scripts/watch-ghcr.sh >> /var/log/bs-watch.log 2>&1
+```
+
+Compara o ID da imagem `:main` no GHCR com o que o container roda; quando
+diverge, deriva a tag imutável `sha-<short>` do label
+`org.opencontainers.image.revision` e chama o `deploy-component.sh`. Assim o
+`.env` registra o commit exato, não um ponteiro que se move. Backend antes do
+frontend, como o `docs/RELEASE.md` exige.
+
+> **Por que pull e não webhook.** O desenho anterior tinha o runner do GitHub
+> chamando `deploy.brainsentry.com.br`, e essa direção não é confiável aqui:
+> 5 tentativas de connect em 2 minutos deram timeout enquanto a mesma URL
+> respondia em 0,098s de outra origem — e a VPS alcança o GHCR em 0,03s. O SYN
+> não chega na máquina (fail2ban sem banidos, `INPUT ACCEPT`, nada nos logs do
+> Caddy), então o bloqueio é upstream, provavelmente proteção do provedor
+> contra faixas de datacenter — e runners do GitHub são Azure. Retry não
+> resolve rota bloqueada; inverter a direção resolve.
 
 ## Configuração
 
@@ -165,12 +187,10 @@ WARN no log antes de investigar qualquer outra coisa.
 ```
 brainsentry-devops/
 ├── docker-compose.yml            falkordb + backend + frontend
-├── docker-compose.webhook.yml    receiver de CD (projeto compose isolado)
 ├── .env.example
 ├── caddy/brainsentry.caddy       bloco do Caddy compartilhado
 ├── config/config.production.yaml montado em /app/config.yaml
-├── webhook/                      Dockerfile + hooks.yaml
-├── scripts/                      setup, ensure-db, deploy, migrate, …
+├── scripts/                      setup, ensure-db, deploy, migrate, watch-ghcr, …
 ├── docs/                         RELEASE, runbook, dns
 └── swarm/                        alvo antigo (Swarm Integrall)
 ```

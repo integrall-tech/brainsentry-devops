@@ -6,11 +6,12 @@
 #   3) migrações (os .sql vêm de dentro da imagem do backend)
 #   4) admin inicial (idempotente)
 #   5) roteamento no Caddy compartilhado
-#   6) (opcional) receiver de CD
 # Uso:
-#   scripts/deploy.sh              # tudo, menos o webhook
-#   scripts/deploy.sh --webhook    # também sobe o receiver de CD
+#   scripts/deploy.sh              # sobe tudo
 #   scripts/deploy.sh --no-migrate # pula as migrações
+#
+# O CD contínuo é por PULL (scripts/watch-ghcr.sh no cron), não por webhook —
+# ver a explicação lá.
 # =============================================================================
 set -euo pipefail
 
@@ -19,11 +20,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
-WITH_WEBHOOK=0
 DO_MIGRATE=1
 for arg in "$@"; do
   case "$arg" in
-    --webhook)    WITH_WEBHOOK=1 ;;
     --no-migrate) DO_MIGRATE=0 ;;
     *) echo "opção desconhecida: $arg" >&2; exit 2 ;;
   esac
@@ -45,14 +44,14 @@ for net in bluevix_web bluevix_internal; do
     || { echo "FATAL: rede $net não existe (a stack bluevix está no ar?)." >&2; exit 1; }
 done
 
-echo "[1/6] Garantindo role/database/pgvector no Postgres compartilhado…"
+echo "[1/5] Garantindo role/database/pgvector no Postgres compartilhado…"
 "$SCRIPT_DIR/ensure-db.sh"
 
-echo "[2/6] Baixando imagens e subindo a stack…"
+echo "[2/5] Baixando imagens e subindo a stack…"
 dc -f docker-compose.yml pull
 dc -f docker-compose.yml up -d --remove-orphans
 
-echo "[3/6] Aguardando health do backend…"
+echo "[3/5] Aguardando health do backend…"
 status=""
 for _ in $(seq 1 45); do
   status="$(docker inspect --format '{{.State.Health.Status}}' brainsentry-backend 2>/dev/null || echo starting)"
@@ -66,7 +65,7 @@ if [[ "$status" != "healthy" ]]; then
 fi
 
 if [[ "$DO_MIGRATE" == "1" ]]; then
-  echo "[4/6] Aplicando migrações…"
+  echo "[4/5] Aplicando migrações…"
   "$SCRIPT_DIR/migrate.sh"
   echo "      admin inicial…"
   "$SCRIPT_DIR/seed-admin.sh"
@@ -80,18 +79,11 @@ if [[ "$DO_MIGRATE" == "1" ]]; then
   sleep 5   # o backend precisa estar de pé para o docker exec
   "$SCRIPT_DIR/rebuild-graph.sh" || echo "AVISO: rebuild do grafo falhou (não bloqueia o deploy)" >&2
 else
-  echo "[4/6] (migrações puladas por --no-migrate)"
+  echo "[4/5] (migrações puladas por --no-migrate)"
 fi
 
-echo "[5/6] Sincronizando roteamento no Caddy compartilhado…"
+echo "[5/5] Sincronizando roteamento no Caddy compartilhado…"
 "$SCRIPT_DIR/caddy-sync.sh"
-
-if [[ "$WITH_WEBHOOK" == "1" ]]; then
-  echo "[6/6] Subindo receiver de CD…"
-  dc -f docker-compose.webhook.yml up -d --build
-else
-  echo "[6/6] (webhook não solicitado — use --webhook para subir o receiver de CD)"
-fi
 
 docker image prune -f >/dev/null 2>&1 || true
 

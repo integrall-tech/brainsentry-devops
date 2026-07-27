@@ -25,9 +25,4 @@ api.${ROOT_DOMAIN} {
 ${ROOT_DOMAIN}, www.${ROOT_DOMAIN} {
 	redir https://app.${ROOT_DOMAIN}{uri} permanent
 }
-
-# Receiver de CD (adnanh/webhook). Protegido por X-Deploy-Token.
-deploy.${ROOT_DOMAIN} {
-	reverse_proxy brainsentry-webhook:9000
-}
 # <<< brainsentry <<<
