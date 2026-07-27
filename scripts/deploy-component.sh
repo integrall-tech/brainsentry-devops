@@ -36,7 +36,11 @@ update_backend() {
   echo "[deploy-component] backend → $TAG"
   set_tag BACKEND_IMAGE_TAG "$TAG"
   dc -f docker-compose.yml pull brainsentry-backend
-  dc -f docker-compose.yml up -d brainsentry-backend
+  # --no-deps: sem isto o compose reavalia as dependências e recria o que
+  # estiver fora de sincronia. Um deploy só do frontend chegou a recriar o
+  # backend a partir da imagem `latest` já em cache — ou seja, um componente
+  # arrastava o outro para uma versão que ninguém pediu.
+  dc -f docker-compose.yml up -d --no-deps brainsentry-backend
   # Espera ficar healthy antes de migrar — migrate.sh lê /app/migrations dele.
   for _ in $(seq 1 45); do
     [[ "$(docker inspect --format '{{.State.Health.Status}}' brainsentry-backend 2>/dev/null)" == "healthy" ]] && break
@@ -49,7 +53,8 @@ update_frontend() {
   echo "[deploy-component] frontend → $TAG"
   set_tag FRONTEND_IMAGE_TAG "$TAG"
   dc -f docker-compose.yml pull brainsentry-frontend
-  dc -f docker-compose.yml up -d brainsentry-frontend
+  # --no-deps pelo mesmo motivo do backend: isolar o componente pedido.
+  dc -f docker-compose.yml up -d --no-deps brainsentry-frontend
 }
 
 case "$COMPONENT" in
